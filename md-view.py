@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import markdown
-from PyQt6.QtCore import QSettings, QSize, Qt, QUrl
+from PyQt6.QtCore import QSettings, QSize, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -24,18 +25,23 @@ from PyQt6.QtGui import (
     QMovie,
     QPalette,
     QPixmap,
+    QTextCursor,
+    QTextDocument,
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -44,7 +50,17 @@ APP_NAME = "MD View"
 VERSION = "v1.00.00"
 WINDOW_TITLE = "%s - %s - LanDen Labs 2026" % (APP_NAME, VERSION)
 
-MD_EXTENSIONS = ["extra", "tables", "fenced_code", "sane_lists", "toc", "codehilite"]
+MD_EXTENSIONS = [
+    "extra",
+    "tables",
+    "sane_lists",
+    "toc",
+    # pymdownx.superfences replaces the stock fenced_code/codehilite extensions:
+    # it correctly recognizes ``` fences nested inside list items and blockquotes,
+    # which python-markdown's built-in fenced_code silently fails to convert.
+    "pymdownx.superfences",
+    "pymdownx.highlight",
+]
 
 SETTINGS_ORG = "LanDenLabs"
 SETTINGS_APP = "MdView"
@@ -52,6 +68,31 @@ DEFAULT_THEME = "Light"
 
 _ZOOM_MIN_DELTA = -6
 _ZOOM_MAX_DELTA = 12
+
+# Qt's rich-text CSS subset doesn't honor `border-bottom` on block elements
+# (silently ignored), so the h1/h2 underline VS Code's preview draws is added
+# as a literal <hr> tag after those headings instead -- see _add_heading_rules().
+_HEADING_CLOSE_RE = re.compile(r"</h[12]>")
+
+_DOC_CSS_LIGHT = """
+pre { background-color: #f0f0f0; padding: 8px; border-radius: 4px; }
+code { background-color: #f0f0f0; padding: 1px 3px; border-radius: 3px; }
+pre code { background-color: transparent; padding: 0; }
+hr { color: #d0d7de; background-color: #d0d7de; }
+"""
+
+_DOC_CSS_DARK = """
+pre { background-color: #2d333b; padding: 8px; border-radius: 4px; }
+code { background-color: #2d333b; padding: 1px 3px; border-radius: 3px; }
+pre code { background-color: transparent; padding: 0; }
+hr { color: #545d68; background-color: #545d68; }
+"""
+
+
+def _add_heading_rules(html: str) -> str:
+    """Insert an <hr> after every h1/h2 closing tag, matching the underline
+    VS Code's Markdown preview draws under top-level headings."""
+    return _HEADING_CLOSE_RE.sub(lambda m: m.group(0) + "<hr>", html)
 
 
 def _apply_theme(theme: str) -> None:
@@ -233,6 +274,28 @@ class AboutDialog(QDialog):
         self._last_frame_num = frame_num
 
 
+class _FindLineEdit(QLineEdit):
+    """QLineEdit that turns Enter/Shift+Enter into find-next/find-previous
+    and Escape into a close request, matching common browser find bars."""
+
+    findNext = pyqtSignal()
+    findPrevious = pyqtSignal()
+    closeRequested = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.closeRequested.emit()
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.findPrevious.emit()
+            else:
+                self.findNext.emit()
+            return
+        super().keyPressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, initial_path: str | None = None):
         super().__init__()
@@ -250,7 +313,17 @@ class MainWindow(QMainWindow):
         self._viewer.setOpenExternalLinks(True)
         self._viewer.setOpenLinks(False)
         self._viewer.anchorClicked.connect(self._on_anchor_clicked)
-        self.setCentralWidget(self._viewer)
+        self._apply_doc_stylesheet()
+
+        find_bar = self._build_find_bar()
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(find_bar)
+        central_layout.addWidget(self._viewer)
+        self.setCentralWidget(central)
 
         self._zoom_delta = self._settings.value("zoom_delta", 0, type=int)
         self._zoom_delta = max(_ZOOM_MIN_DELTA, min(_ZOOM_MAX_DELTA, self._zoom_delta))
@@ -281,6 +354,13 @@ class MainWindow(QMainWindow):
         exit_act.setShortcut(QKeySequence.StandardKey.Quit)
         exit_act.triggered.connect(self.close)
         file_menu.addAction(exit_act)
+
+        edit_menu = self.menuBar().addMenu("&Edit")
+
+        find_act = QAction("&Find...", self)
+        find_act.setShortcut(QKeySequence.StandardKey.Find)
+        find_act.triggered.connect(self._open_find_bar)
+        edit_menu.addAction(find_act)
 
         view_menu = self.menuBar().addMenu("&View")
 
@@ -342,10 +422,123 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(zoom_frame)
         self._update_zoom_label()
 
+    def _build_find_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setVisible(False)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+
+        layout.addWidget(QLabel("Find:"))
+
+        self._find_edit = _FindLineEdit()
+        self._find_edit.setClearButtonEnabled(True)
+        self._find_edit.textChanged.connect(self._on_find_text_changed)
+        self._find_edit.findNext.connect(lambda: self._find(1))
+        self._find_edit.findPrevious.connect(lambda: self._find(-1))
+        self._find_edit.closeRequested.connect(self._close_find_bar)
+        layout.addWidget(self._find_edit, 1)
+
+        self._find_match_lbl = QLabel()
+        self._find_match_lbl.setMinimumWidth(80)
+        layout.addWidget(self._find_match_lbl)
+
+        btn_prev = QToolButton()
+        btn_prev.setText("↑")
+        btn_prev.setToolTip("Previous match  (Shift+Enter)")
+        btn_prev.clicked.connect(lambda: self._find(-1))
+        layout.addWidget(btn_prev)
+
+        btn_next = QToolButton()
+        btn_next.setText("↓")
+        btn_next.setToolTip("Next match  (Enter)")
+        btn_next.clicked.connect(lambda: self._find(1))
+        layout.addWidget(btn_next)
+
+        self._find_case_chk = QCheckBox("Case")
+        self._find_case_chk.setToolTip("Match case")
+        self._find_case_chk.toggled.connect(lambda _checked: self._find(1, restart=True))
+        layout.addWidget(self._find_case_chk)
+
+        btn_close = QToolButton()
+        btn_close.setText("✕")
+        btn_close.setToolTip("Close  (Esc)")
+        btn_close.clicked.connect(self._close_find_bar)
+        layout.addWidget(btn_close)
+
+        self._find_bar = bar
+        return bar
+
+    def _open_find_bar(self):
+        self._find_bar.setVisible(True)
+        self._find_edit.setFocus()
+        self._find_edit.selectAll()
+
+    def _close_find_bar(self):
+        self._find_bar.setVisible(False)
+        self._viewer.setFocus()
+
+    def _on_find_text_changed(self, _text: str):
+        self._find(1, restart=True)
+
+    def _find(self, direction: int, restart: bool = False):
+        text = self._find_edit.text()
+        if not text:
+            self._set_find_feedback(None)
+            return
+
+        flags = QTextDocument.FindFlag(0)
+        if self._find_case_chk.isChecked():
+            flags |= QTextDocument.FindFlag.FindCaseSensitively
+        if direction < 0:
+            flags |= QTextDocument.FindFlag.FindBackward
+
+        if restart:
+            # Search from the top of the document (used when the search text
+            # or the case-sensitivity option changes), not from the current match.
+            cursor = self._viewer.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            self._viewer.setTextCursor(cursor)
+
+        found = self._viewer.find(text, flags)
+        if not found:
+            # Wrap around: jump to the start/end of the document and retry.
+            cursor = self._viewer.textCursor()
+            cursor.movePosition(
+                QTextCursor.MoveOperation.End
+                if direction < 0
+                else QTextCursor.MoveOperation.Start
+            )
+            self._viewer.setTextCursor(cursor)
+            found = self._viewer.find(text, flags)
+
+        self._set_find_feedback(found)
+
+    def _set_find_feedback(self, found: bool | None):
+        if found is None:
+            self._find_edit.setStyleSheet("")
+            self._find_match_lbl.setText("")
+        elif found:
+            self._find_edit.setStyleSheet("")
+            self._find_match_lbl.setText("")
+        else:
+            self._find_edit.setStyleSheet("background-color: #f8d7da;")
+            self._find_match_lbl.setText("No matches")
+
     def _on_dark_mode_toggled(self, checked: bool):
         self._theme = "Dark" if checked else "Light"
         _apply_theme(self._theme)
         self._settings.setValue("theme", self._theme)
+        # defaultStyleSheet only affects content parsed *after* it's set, so
+        # the currently displayed document needs a fresh setHtml to pick up
+        # the new code-block/hr colors.
+        self._apply_doc_stylesheet()
+        if self._current_path:
+            self._reload()
+
+    def _apply_doc_stylesheet(self):
+        css = _DOC_CSS_DARK if self._theme == "Dark" else _DOC_CSS_LIGHT
+        self._viewer.document().setDefaultStyleSheet(css)
 
     def _zoom_in(self):
         if self._zoom_delta < _ZOOM_MAX_DELTA:
@@ -415,6 +608,7 @@ class MainWindow(QMainWindow):
             return
 
         html = markdown.markdown(text, extensions=MD_EXTENSIONS)
+        html = _add_heading_rules(html)
         self._viewer.document().setBaseUrl(QUrl.fromLocalFile(str(file_path.parent) + "/"))
         self._viewer.setHtml(html)
         self._apply_zoom()
