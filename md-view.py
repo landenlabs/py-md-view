@@ -3,17 +3,20 @@
 # Copyright (c) 2026 LanDen Labs - Dennis Lang
 # https://landenlabs.com
 # ----------------------------------------------------------------------
-"""md-view - View Markdown files (including embedded HTML) in a Qt window."""
+"""md-view - View Markdown files (including embedded HTML and mermaid
+diagrams) in a Qt window."""
 
 from __future__ import annotations
 
+import json
 import re
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import markdown
-from PyQt6.QtCore import QSettings, QSize, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -25,9 +28,9 @@ from PyQt6.QtGui import (
     QMovie,
     QPalette,
     QPixmap,
-    QTextCursor,
-    QTextDocument,
 )
+from PyQt6.QtWebEngineCore import QWebEnginePage
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,7 +43,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QTextBrowser,
+    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -66,37 +69,90 @@ SETTINGS_ORG = "LanDenLabs"
 SETTINGS_APP = "MdView"
 DEFAULT_THEME = "Light"
 
-_ZOOM_MIN_DELTA = -6
-_ZOOM_MAX_DELTA = 12
+_ZOOM_MIN_PCT = 30
+_ZOOM_MAX_PCT = 300
+_ZOOM_STEP_PCT = 10
+_DEFAULT_ZOOM_PCT = 100
 
-# Qt's rich-text CSS subset doesn't honor `border-bottom` on block elements
-# (silently ignored), so the h1/h2 underline VS Code's preview draws is added
-# as a literal <hr> tag after those headings instead -- see _add_heading_rules().
-_HEADING_CLOSE_RE = re.compile(r"</h[12]>")
+# pymdownx.superfences renders ```mermaid fences as <pre class="highlight">
+# <code class="language-mermaid">...</code></pre>. Swap that wrapper for
+# <pre class="mermaid">, which mermaid.js finds and replaces with a rendered
+# SVG diagram. The HTML-escaped entities inside are left untouched -- the
+# browser decodes them into the raw diagram source when parsing the text
+# node, same as it would for any other element, so no manual unescaping
+# is needed (and none of it gets re-parsed as markup).
+_MERMAID_BLOCK_RE = re.compile(
+    r'<pre[^>]*><code class="language-mermaid">(.*?)</code></pre>',
+    re.DOTALL,
+)
+
+
+def _convert_mermaid_blocks(html: str) -> str:
+    return _MERMAID_BLOCK_RE.sub(r'<pre class="mermaid">\1</pre>', html)
+
+
+_COMMON_DOC_CSS = """
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+    margin: 16px;
+}
+table { border-collapse: collapse; }
+th, td { border: 1px solid currentColor; padding: 4px 8px; }
+pre.mermaid, div.mermaid { text-align: center; }
+"""
 
 _DOC_CSS_LIGHT = """
-pre { background-color: #f0f0f0; padding: 8px; border-radius: 4px; }
+body { background: #ffffff; color: #1f2328; }
+a { color: #0969da; }
+h1, h2 { border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }
+pre:not(.mermaid) { background-color: #f0f0f0; padding: 8px; border-radius: 4px; overflow-x: auto; }
 code { background-color: #f0f0f0; padding: 1px 3px; border-radius: 3px; }
 pre code { background-color: transparent; padding: 0; }
-hr { color: #d0d7de; background-color: #d0d7de; }
+hr { border: none; border-top: 1px solid #d0d7de; }
 """
 
 _DOC_CSS_DARK = """
-pre { background-color: #2d333b; padding: 8px; border-radius: 4px; }
+body { background: #1e1e1e; color: #d4d4d4; }
+a { color: #4ea1ff; }
+h1, h2 { border-bottom: 1px solid #444c56; padding-bottom: 0.3em; }
+pre:not(.mermaid) { background-color: #2d333b; padding: 8px; border-radius: 4px; overflow-x: auto; }
 code { background-color: #2d333b; padding: 1px 3px; border-radius: 3px; }
 pre code { background-color: transparent; padding: 0; }
-hr { color: #545d68; background-color: #545d68; }
+hr { border: none; border-top: 1px solid #545d68; }
 """
 
 
-def _add_heading_rules(html: str) -> str:
-    """Insert an <hr> after every h1/h2 closing tag, matching the underline
-    VS Code's Markdown preview draws under top-level headings."""
-    return _HEADING_CLOSE_RE.sub(lambda m: m.group(0) + "<hr>", html)
+def _mermaid_script_url() -> str:
+    return QUrl.fromLocalFile(str(resource_path("mermaid.min.js"))).toString()
+
+
+def _wrap_html(body_html: str, theme: str) -> str:
+    """Wrap markdown-derived body HTML into a full page: theme-aware CSS,
+    and (only if the document actually contains one) the mermaid.js script
+    plus the call that turns <pre class="mermaid"> blocks into diagrams."""
+    css = _COMMON_DOC_CSS + (_DOC_CSS_DARK if theme == "Dark" else _DOC_CSS_LIGHT)
+    mermaid_block = ""
+    if 'class="mermaid"' in body_html:
+        mermaid_theme = "dark" if theme == "Dark" else "default"
+        mermaid_block = (
+            '<script src="%s"></script>\n'
+            '<script>\n'
+            '  mermaid.initialize({ startOnLoad: false, theme: "%s" });\n'
+            '  mermaid.run();\n'
+            '</script>\n' % (_mermaid_script_url(), mermaid_theme)
+        )
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<style>%s</style></head><body>\n%s\n%s</body></html>"
+        % (css, body_html, mermaid_block)
+    )
 
 
 def _apply_theme(theme: str) -> None:
-    """Apply ``theme`` ("Light" or "Dark") to the running QApplication."""
+    """Apply ``theme`` ("Light" or "Dark") to the running QApplication's
+    chrome (menus, dialogs, status bar) -- the document view is a separate
+    web page and gets its own theme-aware CSS from _wrap_html()."""
     app = QApplication.instance()
     if app is None:
         return
@@ -219,7 +275,8 @@ class AboutDialog(QDialog):
         root.addLayout(header)
 
         desc = QLabel(
-            "%s  —  A Markdown viewer that also renders embedded raw HTML."
+            "%s  —  A Markdown viewer that also renders embedded raw HTML "
+            "and mermaid diagrams."
             % VERSION
         )
         desc.setWordWrap(True)
@@ -296,6 +353,24 @@ class _FindLineEdit(QLineEdit):
         super().keyPressEvent(event)
 
 
+class _LinkHandlingPage(QWebEnginePage):
+    """Local .md links load in-place; everything else opens in the system
+    browser instead of navigating the embedded view away from the document."""
+
+    def __init__(self, main_window: "MainWindow", parent=None):
+        super().__init__(parent)
+        self._main_window = main_window
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame) -> bool:
+        if nav_type != QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            return True
+        if url.isLocalFile() and url.path().lower().endswith((".md", ".markdown", ".mdown", ".mkd")):
+            self._main_window.load_file(url.toLocalFile())
+        else:
+            QDesktopServices.openUrl(url)
+        return False
+
+
 class MainWindow(QMainWindow):
     def __init__(self, initial_path: str | None = None):
         super().__init__()
@@ -309,11 +384,13 @@ class MainWindow(QMainWindow):
         if self._theme not in ("Light", "Dark"):
             self._theme = DEFAULT_THEME
 
-        self._viewer = QTextBrowser()
-        self._viewer.setOpenExternalLinks(True)
-        self._viewer.setOpenLinks(False)
-        self._viewer.anchorClicked.connect(self._on_anchor_clicked)
-        self._apply_doc_stylesheet()
+        self._zoom_pct = self._settings.value("zoom_pct", _DEFAULT_ZOOM_PCT, type=int)
+        self._zoom_pct = max(_ZOOM_MIN_PCT, min(_ZOOM_MAX_PCT, self._zoom_pct))
+
+        self._viewer = QWebEngineView()
+        self._page = _LinkHandlingPage(self, self._viewer)
+        self._viewer.setPage(self._page)
+        self._apply_zoom()
 
         find_bar = self._build_find_bar()
 
@@ -324,9 +401,6 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(find_bar)
         central_layout.addWidget(self._viewer)
         self.setCentralWidget(central)
-
-        self._zoom_delta = self._settings.value("zoom_delta", 0, type=int)
-        self._zoom_delta = max(_ZOOM_MIN_DELTA, min(_ZOOM_MAX_DELTA, self._zoom_delta))
 
         self._build_menu()
         self._build_status_bar()
@@ -425,6 +499,10 @@ class MainWindow(QMainWindow):
     def _build_find_bar(self) -> QWidget:
         bar = QWidget()
         bar.setVisible(False)
+        # Without a Fixed vertical policy, the surrounding QVBoxLayout treats
+        # this bar as free to grow and hands it most of the leftover space
+        # instead of the web view, ballooning it to ~10x its sizeHint.
+        bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(4)
@@ -457,7 +535,7 @@ class MainWindow(QMainWindow):
 
         self._find_case_chk = QCheckBox("Case")
         self._find_case_chk.setToolTip("Match case")
-        self._find_case_chk.toggled.connect(lambda _checked: self._find(1, restart=True))
+        self._find_case_chk.toggled.connect(lambda _checked: self._find(1))
         layout.addWidget(self._find_case_chk)
 
         btn_close = QToolButton()
@@ -475,109 +553,86 @@ class MainWindow(QMainWindow):
         self._find_edit.selectAll()
 
     def _close_find_bar(self):
+        self._viewer.page().runJavaScript("window.getSelection().removeAllRanges();")
         self._find_bar.setVisible(False)
         self._viewer.setFocus()
 
     def _on_find_text_changed(self, _text: str):
-        self._find(1, restart=True)
+        self._find(1)
 
-    def _find(self, direction: int, restart: bool = False):
+    def _find(self, direction: int = 1):
         text = self._find_edit.text()
         if not text:
+            self._viewer.page().runJavaScript("window.getSelection().removeAllRanges();")
             self._set_find_feedback(None)
             return
 
-        flags = QTextDocument.FindFlag(0)
-        if self._find_case_chk.isChecked():
-            flags |= QTextDocument.FindFlag.FindCaseSensitively
-        if direction < 0:
-            flags |= QTextDocument.FindFlag.FindBackward
-
-        if restart:
-            # Search from the top of the document (used when the search text
-            # or the case-sensitivity option changes), not from the current match.
-            cursor = self._viewer.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.Start)
-            self._viewer.setTextCursor(cursor)
-
-        found = self._viewer.find(text, flags)
-        if not found:
-            # Wrap around: jump to the start/end of the document and retry.
-            cursor = self._viewer.textCursor()
-            cursor.movePosition(
-                QTextCursor.MoveOperation.End
-                if direction < 0
-                else QTextCursor.MoveOperation.Start
-            )
-            self._viewer.setTextCursor(cursor)
-            found = self._viewer.find(text, flags)
-
-        self._set_find_feedback(found)
+        # QWebEnginePage.findText()'s resultCallback receives a
+        # QWebEngineFindTextResult whose numberOfMatches() came back 0 even
+        # for confirmed matches in this PyQt6-WebEngine build -- unreliable.
+        # window.find() is a simpler native primitive: it searches, selects
+        # and scrolls to the match, wraps around, and returns a plain bool.
+        args = [
+            text,
+            self._find_case_chk.isChecked(),  # caseSensitive
+            direction < 0,  # backwards
+            True,   # wrapAround
+            False,  # wholeWord
+            True,   # searchInFrames
+            False,  # showDialog
+        ]
+        js = "window.find.apply(window, %s)" % json.dumps(args)
+        self._viewer.page().runJavaScript(js, self._set_find_feedback)
 
     def _set_find_feedback(self, found: bool | None):
-        if found is None:
-            self._find_edit.setStyleSheet("")
-            self._find_match_lbl.setText("")
-        elif found:
+        if found or found is None:
             self._find_edit.setStyleSheet("")
             self._find_match_lbl.setText("")
         else:
-            self._find_edit.setStyleSheet("background-color: #f8d7da;")
+            # Explicit text color needed here: in dark theme the app palette's
+            # white text color would otherwise show through on this light-pink
+            # background (the stylesheet only overrides what it sets).
+            self._find_edit.setStyleSheet("background-color: #f8d7da; color: #000000;")
             self._find_match_lbl.setText("No matches")
 
     def _on_dark_mode_toggled(self, checked: bool):
         self._theme = "Dark" if checked else "Light"
         _apply_theme(self._theme)
         self._settings.setValue("theme", self._theme)
-        # defaultStyleSheet only affects content parsed *after* it's set, so
-        # the currently displayed document needs a fresh setHtml to pick up
-        # the new code-block/hr colors.
-        self._apply_doc_stylesheet()
+        # Doc CSS and the mermaid theme are baked into the wrapped HTML at
+        # render time, so the current document needs a fresh load to pick
+        # up the new colors.
         if self._current_path:
             self._reload()
 
-    def _apply_doc_stylesheet(self):
-        css = _DOC_CSS_DARK if self._theme == "Dark" else _DOC_CSS_LIGHT
-        self._viewer.document().setDefaultStyleSheet(css)
-
     def _zoom_in(self):
-        if self._zoom_delta < _ZOOM_MAX_DELTA:
-            self._zoom_delta += 1
-            self._viewer.zoomIn(1)
+        if self._zoom_pct < _ZOOM_MAX_PCT:
+            self._zoom_pct = min(_ZOOM_MAX_PCT, self._zoom_pct + _ZOOM_STEP_PCT)
+            self._apply_zoom()
             self._on_zoom_changed()
 
     def _zoom_out(self):
-        if self._zoom_delta > _ZOOM_MIN_DELTA:
-            self._zoom_delta -= 1
-            self._viewer.zoomOut(1)
+        if self._zoom_pct > _ZOOM_MIN_PCT:
+            self._zoom_pct = max(_ZOOM_MIN_PCT, self._zoom_pct - _ZOOM_STEP_PCT)
+            self._apply_zoom()
             self._on_zoom_changed()
 
     def _zoom_reset(self):
-        if self._zoom_delta == 0:
+        if self._zoom_pct == _DEFAULT_ZOOM_PCT:
             return
-        if self._zoom_delta > 0:
-            self._viewer.zoomOut(self._zoom_delta)
-        else:
-            self._viewer.zoomIn(-self._zoom_delta)
-        self._zoom_delta = 0
+        self._zoom_pct = _DEFAULT_ZOOM_PCT
+        self._apply_zoom()
         self._on_zoom_changed()
 
     def _on_zoom_changed(self):
         self._update_zoom_label()
-        self._settings.setValue("zoom_delta", self._zoom_delta)
+        self._settings.setValue("zoom_pct", self._zoom_pct)
 
     def _update_zoom_label(self):
-        base_pt = self._viewer.font().pointSize()
-        if base_pt <= 0:
-            base_pt = 12
-        pct = round(100 * (base_pt + self._zoom_delta) / base_pt)
-        self._lbl_zoom.setText("%d%%" % pct)
+        self._lbl_zoom.setText("%d%%" % self._zoom_pct)
 
     def _apply_zoom(self):
-        if self._zoom_delta > 0:
-            self._viewer.zoomIn(self._zoom_delta)
-        elif self._zoom_delta < 0:
-            self._viewer.zoomOut(-self._zoom_delta)
+        self._viewer.setZoomFactor(self._zoom_pct / 100.0)
 
     def _browse_open(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -593,12 +648,6 @@ class MainWindow(QMainWindow):
         if self._current_path:
             self.load_file(str(self._current_path))
 
-    def _on_anchor_clicked(self, url: QUrl):
-        if url.isLocalFile() and url.path().lower().endswith((".md", ".markdown", ".mdown", ".mkd")):
-            self.load_file(url.toLocalFile())
-        else:
-            QDesktopServices.openUrl(url)
-
     def load_file(self, path: str):
         file_path = Path(path).expanduser().resolve()
         try:
@@ -607,15 +656,20 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "Could not read file:\n%s" % exc)
             return
 
-        html = markdown.markdown(text, extensions=MD_EXTENSIONS)
-        html = _add_heading_rules(html)
-        self._viewer.document().setBaseUrl(QUrl.fromLocalFile(str(file_path.parent) + "/"))
-        self._viewer.setHtml(html)
+        body_html = markdown.markdown(text, extensions=MD_EXTENSIONS)
+        body_html = _convert_mermaid_blocks(body_html)
+        full_html = _wrap_html(body_html, self._theme)
+        self._viewer.setHtml(full_html, baseUrl=QUrl.fromLocalFile(str(file_path.parent) + "/"))
         self._apply_zoom()
 
         self._current_path = file_path
         self.setWindowTitle("%s - %s - LanDen Labs 2026" % (file_path.name, VERSION))
         self.statusBar().showMessage(str(file_path))
+
+
+def _handle_sigint(*_args):
+    print("\nControl+c detected, closing app")
+    QApplication.quit()
 
 
 def main():
@@ -629,6 +683,14 @@ def main():
         theme = DEFAULT_THEME
     _apply_theme(theme)
     app.setWindowIcon(app_icon())
+
+    # Qt's event loop blocks Python's signal handling, so a bare SIGINT
+    # handler would never run until the next Qt event; a periodic timer
+    # keeps the interpreter ticking so Ctrl+C is caught promptly.
+    signal.signal(signal.SIGINT, _handle_sigint)
+    sigint_timer = QTimer()
+    sigint_timer.timeout.connect(lambda: None)
+    sigint_timer.start(200)
 
     initial_path = sys.argv[1] if len(sys.argv) > 1 else None
     win = MainWindow(initial_path)

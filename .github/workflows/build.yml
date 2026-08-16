@@ -38,6 +38,7 @@ jobs:
           pyinstaller ${{ matrix.onefile_flag }} --windowed --name md-view
           --icon "${{ matrix.icon }}"
           --add-data "icon.png${{ matrix.add_data_sep }}."
+          --add-data "mermaid.min.js${{ matrix.add_data_sep }}."
           md-view.py
 
       # macOS --windowed always builds a .app bundle (onedir under the hood);
